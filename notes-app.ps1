@@ -34,6 +34,9 @@ $script:IgnoreTextChange = $false
 $script:SortMode         = 0
 $script:SortLabels       = @("Name A-Z", "Name Z-A", "Modified", "Created")
 $script:SaveTimer        = $null
+$script:InfoTimer        = $null
+$script:InfoUpdateMs     = 300
+$script:EditorUndoLimit  = 30
 $script:SidebarVisible   = $true
 $script:TabBarVisible    = $true
 $script:ZenMode          = $false
@@ -202,6 +205,7 @@ $xamlString = @'
                         CaretBrush="#7B6FF0" SelectionBrush="#4040A0"
                         BorderThickness="0" Padding="20,14"
                         FontFamily="Cascadia Code,Consolas,Courier New" FontSize="14"
+                        UndoLimit="30"
                         IsEnabled="False"/>
                 </Border>
             </Grid>
@@ -261,6 +265,8 @@ $sidebarBorder   = $window.FindName('SidebarBorder')
 $splitter        = $window.FindName('Splitter')
 $statusBarBorder = $window.FindName('StatusBarBorder')
 
+$editor.UndoLimit = $script:EditorUndoLimit
+
 # Make buttons clickable through WindowChrome caption area
 foreach ($btn in @($btnZen, $btnSidebar, $btnTabBar, $btnPin, $btnMin, $btnClose, $btnNewTab)) {
     [System.Windows.Shell.WindowChrome]::SetIsHitTestVisibleInChrome($btn, $true)
@@ -269,13 +275,48 @@ foreach ($btn in @($btnZen, $btnSidebar, $btnTabBar, $btnPin, $btnMin, $btnClose
 # ===================== UTILITY FUNCTIONS =====================
 function Set-Status ([string]$msg) { $statusText.Text = $msg }
 
+function Get-TextStats ([string]$text) {
+    if ([string]::IsNullOrEmpty($text)) {
+        return [pscustomobject]@{ Lines = 1; Words = 0 }
+    }
+
+    $lines = 1
+    $words = 0
+    $inWord = $false
+
+    for ($i = 0; $i -lt $text.Length; $i++) {
+        $ch = $text[$i]
+        if ($ch -eq "`n") { $lines++ }
+
+        if ([char]::IsWhiteSpace($ch)) {
+            $inWord = $false
+        } elseif (-not $inWord) {
+            $words++
+            $inWord = $true
+        }
+    }
+
+    return [pscustomobject]@{ Lines = $lines; Words = $words }
+}
+
 function Update-Info {
     if ($script:ActiveTab -ge 0 -and $script:ActiveTab -lt $script:Tabs.Count) {
-        $text  = $editor.Text
-        $words = if ($text.Trim()) { ($text -split '\s+').Count } else { 0 }
-        $lines = ($text -split "`n").Count
-        $infoText.Text = "Ln $lines  |  $words words"
+        $stats = Get-TextStats $editor.Text
+        $infoText.Text = "Ln $($stats.Lines)  |  $($stats.Words) words"
     } else { $infoText.Text = '' }
+}
+
+function Request-InfoUpdate {
+    if ($script:InfoTimer) {
+        $script:InfoTimer.Stop()
+        $script:InfoTimer.Start()
+    } else {
+        Update-Info
+    }
+}
+
+function Clear-EditorUndo {
+    try { $editor.ClearUndo() } catch {}
 }
 
 function Get-UniquePath ([string]$dir, [string]$base) {
@@ -529,6 +570,7 @@ function Switch-Tab ([int]$idx) {
     $script:ActiveTab = $idx
     $script:IgnoreTextChange = $true
     $editor.Text = $script:Tabs[$idx].Content
+    Clear-EditorUndo
     $editor.IsEnabled = $true
     $script:IgnoreTextChange = $false
     if ($old -ge 0 -and $old -lt $script:Tabs.Count) { Update-TabVisual $old }
@@ -553,6 +595,29 @@ function Add-NoteTab ($filePath = $null, [string]$content = '', [bool]$switchTo 
     if ($switchTo) { Switch-Tab $idx }
 }
 
+function Release-TabResources ($tab) {
+    if (-not $tab) { return }
+
+    if ($tab.Element) {
+        try { $tab.Element.Child = $null } catch {}
+    }
+
+    $tab.Element = $null
+    $tab.TitleBlock = $null
+    $tab.Content = $null
+}
+
+function Remove-TabAt ([int]$idx) {
+    if ($idx -lt 0 -or $idx -ge $script:Tabs.Count) { return }
+    $tab = $script:Tabs[$idx]
+
+    if ($idx -lt $tabBar.Children.Count) {
+        $tabBar.Children.RemoveAt($idx)
+    }
+    Release-TabResources $tab
+    $script:Tabs.RemoveAt($idx)
+}
+
 function Close-Tab ([int]$idx) {
     if ($idx -lt 0 -or $idx -ge $script:Tabs.Count) { return }
     $tab = $script:Tabs[$idx]
@@ -572,8 +637,7 @@ function Close-Tab ([int]$idx) {
     }
     # No file on disk for unsaved empty tabs - nothing to clean up
 
-    $tabBar.Children.RemoveAt($idx)
-    $script:Tabs.RemoveAt($idx)
+    Remove-TabAt $idx
 
     if ($script:Tabs.Count -eq 0) {
         $script:ActiveTab = -1
@@ -644,7 +708,7 @@ function Add-FileContextMenu ($treeItem, $filePath) {
         if ($r -eq 'Yes') {
             for ($i = $script:Tabs.Count-1; $i -ge 0; $i--) {
                 if ($script:Tabs[$i].FilePath -eq $fp) {
-                    $tabBar.Children.RemoveAt($i); $script:Tabs.RemoveAt($i)
+                    Remove-TabAt $i
                     if ($script:ActiveTab -ge $i) { $script:ActiveTab-- }
                 }
             }
@@ -707,7 +771,7 @@ function Add-FolderContextMenu ($treeItem, $folderPath) {
         if ($r -eq 'Yes') {
             for ($i = $script:Tabs.Count-1; $i -ge 0; $i--) {
                 if ($script:Tabs[$i].FilePath -and $script:Tabs[$i].FilePath.StartsWith($fp)) {
-                    $tabBar.Children.RemoveAt($i); $script:Tabs.RemoveAt($i)
+                    Remove-TabAt $i
                     if ($script:ActiveTab -ge $i) { $script:ActiveTab-- }
                 }
             }
@@ -724,8 +788,32 @@ function Add-FolderContextMenu ($treeItem, $folderPath) {
     $treeItem.ContextMenu = $cm
 }
 
-function Refresh-Sidebar {
+function Clear-TreeItemResources ([System.Windows.Controls.ItemsControl]$item) {
+    foreach ($child in @($item.Items)) {
+        if ($child -is [System.Windows.Controls.ItemsControl]) {
+            Clear-TreeItemResources $child
+        }
+    }
+
+    if ($item -is [System.Windows.Controls.TreeViewItem]) {
+        $item.ContextMenu = $null
+    }
+
+    $item.Items.Clear()
+}
+
+function Clear-SidebarTree {
+    foreach ($item in @($fileTree.Items)) {
+        if ($item -is [System.Windows.Controls.ItemsControl]) {
+            Clear-TreeItemResources $item
+        }
+    }
+
     $fileTree.Items.Clear()
+}
+
+function Refresh-Sidebar {
+    Clear-SidebarTree
 
     # Folders (using BMP-safe characters)
     $folders = Get-ChildItem $script:NotesDir -Directory -ErrorAction SilentlyContinue
@@ -826,7 +914,7 @@ $editor.Add_TextChanged({
     if ($script:ActiveTab -ge 0 -and $script:ActiveTab -lt $script:Tabs.Count) {
         $script:Tabs[$script:ActiveTab].IsDirty = $true
         Update-TabVisual $script:ActiveTab
-        Update-Info
+        Request-InfoUpdate
         if ($script:SaveTimer) { $script:SaveTimer.Stop(); $script:SaveTimer.Start() }
     }
 })
@@ -868,6 +956,7 @@ $window.Add_KeyDown({
 # Save all on close, clean up empty Untitled files
 $window.Add_Closing({
     if ($script:SaveTimer) { $script:SaveTimer.Stop() }
+    if ($script:InfoTimer) { $script:InfoTimer.Stop() }
     for ($i = 0; $i -lt $script:Tabs.Count; $i++) {
         if ($i -eq $script:ActiveTab) { $script:Tabs[$i].Content = $editor.Text }
         $tab = $script:Tabs[$i]
@@ -900,6 +989,10 @@ $window.Add_StateChanged({
 $script:SaveTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $script:SaveTimer.Interval = [TimeSpan]::FromMilliseconds($script:AutoSaveMs)
 $script:SaveTimer.Add_Tick({ $script:SaveTimer.Stop(); Save-ActiveTab })
+
+$script:InfoTimer = [System.Windows.Threading.DispatcherTimer]::new()
+$script:InfoTimer.Interval = [TimeSpan]::FromMilliseconds($script:InfoUpdateMs)
+$script:InfoTimer.Add_Tick({ $script:InfoTimer.Stop(); Update-Info })
 
 # ===================== INITIALIZATION =====================
 $existingFiles = Get-ChildItem $script:NotesDir -Filter '*.md' -File -Recurse -ErrorAction SilentlyContinue |
