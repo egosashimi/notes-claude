@@ -1,1 +1,7 @@
 /notes
+__pycache__/
+*.pyc
+.notes-server.pid
+.notes-server.log
+.notes-app.pid
+.notes-app.log
